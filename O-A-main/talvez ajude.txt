@@ -1,0 +1,285 @@
+sql_text = r"""
+-- ============================================================================
+-- Case Técnico – Analista de Dados (Cobrança Amigável)
+-- Item 4: Query SQL de Integração (JOIN entre contatos, clientes, negociadores)
+-- Arquivo: query_integracao_cobranca.sql
+-- Compatibilidade: ANSI SQL (testado conceito para PostgreSQL / MySQL / SQL Server)
+-- Observação: ajuste nomes de schema (ex.: dbo.) e tipos conforme o seu SGBD.
+-- ============================================================================
+
+/*
+Assumimos as seguintes tabelas (ajuste nomes/colunas se necessário):
+  - clientes(
+      cliente_id          BIGINT PK,        -- opcional (pode não existir)
+      cpf_cnpj            VARCHAR(20) NOT NULL,
+      nome_cliente        VARCHAR(255),
+      regiao              VARCHAR(50)
+    )
+
+  - negociadores(
+      negociador_id       BIGINT PK,
+      nome_negociador     VARCHAR(255),
+      equipe              VARCHAR(100)
+    )
+
+  - contatos(
+      contato_id          BIGINT PK,
+      cpf_cnpj            VARCHAR(20) NOT NULL, -- documento do cliente
+      negociador_id       BIGINT,               -- quem fez o contato
+      data_evento         TIMESTAMP NOT NULL,   -- data/hora do evento
+      tipo_evento         VARCHAR(20) NOT NULL, -- PROMESSA, CPC, ACORDO, TENTATIVA, CONTATO
+      canal               VARCHAR(30),          -- TELEFONE, WHATSAPP, EMAIL, SMS, etc.
+      faixa_atraso        VARCHAR(30),
+      regiao              VARCHAR(50),          -- se vier na planilha de eventos
+      valor_divida        DECIMAL(18,2)
+    )
+*/
+
+-- =========================
+-- 1) Normalização de chaves
+-- =========================
+WITH dim_clientes AS (
+  SELECT
+    /* Normaliza CPF/CNPJ retirando pontuações comuns. 
+       REPLACE encadeado funciona em Postgres/MySQL/SQL Server. */
+    REPLACE(REPLACE(REPLACE(UPPER(TRIM(c.cpf_cnpj)), '.', ''), '-', ''), '/', '') AS doc_clean,
+    COALESCE(c.cliente_id, ROW_NUMBER() OVER (ORDER BY (SELECT 1))) AS cliente_id_surrogate,
+    c.nome_cliente,
+    c.regiao AS regiao_cadastro
+  FROM clientes c
+  WHERE c.cpf_cnpj IS NOT NULL
+),
+contatos_norm AS (
+  SELECT
+    ct.contato_id,
+    REPLACE(REPLACE(REPLACE(UPPER(TRIM(ct.cpf_cnpj)), '.', ''), '-', ''), '/', '') AS doc_clean,
+    ct.negociador_id,
+    CAST(ct.data_evento AS DATE) AS dt_evento,
+    ct.data_evento,
+    UPPER(TRIM(ct.tipo_evento)) AS tipo_evento,
+    UPPER(TRIM(ct.canal)) AS canal,
+    UPPER(TRIM(ct.faixa_atraso)) AS faixa_atraso,
+    COALESCE(ct.regiao, '') AS regiao_evento,
+    ct.valor_divida,
+
+    /* Flags úteis para KPIs */
+    CASE WHEN UPPER(TRIM(ct.tipo_evento)) = 'TENTATIVA' THEN 1 ELSE 0 END AS fl_tentativa,
+    CASE WHEN UPPER(TRIM(ct.tipo_evento)) = 'CONTATO'   THEN 1 ELSE 0 END AS fl_contato,
+    CASE WHEN UPPER(TRIM(ct.tipo_evento)) = 'CPC'       THEN 1 ELSE 0 END AS fl_cpc,
+    CASE WHEN UPPER(TRIM(ct.tipo_evento)) = 'PROMESSA'  THEN 1 ELSE 0 END AS fl_promessa,
+    CASE WHEN UPPER(TRIM(ct.tipo_evento)) = 'ACORDO'    THEN 1 ELSE 0 END AS fl_acordo
+  FROM contatos ct
+  WHERE ct.cpf_cnpj IS NOT NULL
+),
+dim_negociadores AS (
+  SELECT
+    n.negociador_id,
+    n.nome_negociador,
+    n.equipe
+  FROM negociadores n
+),
+
+-- =====================================================
+-- 2) Integração base (JOIN) + Colunas padronizadas
+--    Esta view "granular" é a fundação para o dashboard
+-- =====================================================
+base_interacoes AS (
+  SELECT
+    /* Chaves */
+    ctn.contato_id,
+    dc.cliente_id_surrogate AS cliente_id,
+    ctn.negociador_id,
+    ctn.data_evento,
+    ctn.dt_evento,
+
+    /* Dimensões */
+    dc.doc_clean AS cliente_documento,
+    dc.nome_cliente,
+    COALESCE(NULLIF(TRIM(ctn.regiao_evento), ''), dc.regiao_cadastro) AS regiao,
+    ctn.canal,
+    ctn.faixa_atraso,
+    dn.nome_negociador,
+    dn.equipe,
+
+    /* Medidas/atributos */
+    ctn.tipo_evento,
+    ctn.valor_divida,
+
+    /* Flags KPI */
+    ctn.fl_tentativa,
+    ctn.fl_contato,
+    ctn.fl_cpc,
+    ctn.fl_promessa,
+    ctn.fl_acordo
+  FROM contatos_norm ctn
+  LEFT JOIN dim_clientes dc
+    ON dc.doc_clean = ctn.doc_clean
+  LEFT JOIN dim_negociadores dn
+    ON dn.negociador_id = ctn.negociador_id
+)
+
+-- ==================================================================
+-- 3) (Opcional) Criação de uma VIEW para consumo no BI
+--    Se seu SGBD suportar CREATE VIEW, descomente o bloco abaixo
+-- ==================================================================
+/*
+CREATE OR REPLACE VIEW vw_cobranca_interacoes AS
+SELECT * FROM base_interacoes;
+*/
+
+-- ==================================================================
+-- 4) (Opcional) Resumos prontos para o Power BI (exemplos)
+--    a) Conversão por tipo de evento (taxas)
+-- ==================================================================
+, resumo_conversao AS (
+  SELECT
+    dt_evento,
+    regiao,
+    canal,
+    SUM(fl_tentativa) AS tentativas,
+    SUM(fl_contato)   AS contatos,
+    SUM(fl_cpc)       AS cpcs,
+    SUM(fl_promessa)  AS promessas,
+    SUM(fl_acordo)    AS acordos,
+
+    /* Taxas (evite divisão por zero) */
+    CASE WHEN SUM(fl_tentativa) > 0 THEN 1.0 * SUM(fl_contato)  / SUM(fl_tentativa) ELSE 0 END AS taxa_contato_sobre_tentativa,
+    CASE WHEN SUM(fl_contato)   > 0 THEN 1.0 * SUM(fl_cpc)      / SUM(fl_contato)   ELSE 0 END AS taxa_cpc_sobre_contato,
+    CASE WHEN SUM(fl_cpc)       > 0 THEN 1.0 * SUM(fl_promessa) / SUM(fl_cpc)       ELSE 0 END AS taxa_promessa_sobre_cpc,
+    CASE WHEN SUM(fl_promessa)  > 0 THEN 1.0 * SUM(fl_acordo)   / SUM(fl_promessa)  ELSE 0 END AS taxa_acordo_sobre_promessa,
+    CASE WHEN SUM(fl_tentativa) > 0 THEN 1.0 * SUM(fl_acordo)   / SUM(fl_tentativa) ELSE 0 END AS taxa_acordo_sobre_tentativa
+  FROM base_interacoes
+  GROUP BY dt_evento, regiao, canal
+)
+
+-- ==================================================================
+-- 5) (Opcional) Produtividade por negociador
+-- ==================================================================
+, produtividade_negociador AS (
+  SELECT
+    dt_evento,
+    nome_negociador,
+    equipe,
+    COUNT(*) AS interacoes,
+    SUM(fl_tentativa) AS tentativas,
+    SUM(fl_contato)   AS contatos,
+    SUM(fl_cpc)       AS cpcs,
+    SUM(fl_promessa)  AS promessas,
+    SUM(fl_acordo)    AS acordos,
+    SUM(valor_divida) AS valor_dividas_abordadas
+  FROM base_interacoes
+  GROUP BY dt_evento, nome_negociador, equipe
+)
+
+-- ==================================================================
+-- 6) (Opcional) Distribuição por faixa de atraso
+-- ==================================================================
+, distribuicao_atraso AS (
+  SELECT
+    dt_evento,
+    faixa_atraso,
+    COUNT(*) AS qtd_eventos,
+    SUM(fl_acordo) AS acordos
+  FROM base_interacoes
+  GROUP BY dt_evento, faixa_atraso
+)
+
+-- ==================================================================
+-- 7) (Opcional) Efetividade por região e canal
+-- ==================================================================
+, efetividade_regiao_canal AS (
+  SELECT
+    dt_evento,
+    regiao,
+    canal,
+    SUM(fl_acordo) AS acordos,
+    SUM(fl_promessa) AS promessas,
+    SUM(fl_cpc) AS cpcs,
+    SUM(fl_contato) AS contatos,
+    SUM(fl_tentativa) AS tentativas,
+    CASE WHEN SUM(fl_contato) > 0 THEN 1.0 * SUM(fl_acordo) / SUM(fl_contato) ELSE 0 END AS taxa_acordo_sobre_contato
+  FROM base_interacoes
+  GROUP BY dt_evento, regiao, canal
+)
+
+-- ==================================================================
+-- 8) Seleções finais (troque a "saída" que deseja)
+--    - Para BI, normalmente materializamos apenas vw_cobranca_interacoes,
+--      e deixamos estes resumos como medidas no Power BI/DAX.
+--    - Abaixo, por conveniência, exibimos 4 selects de exemplo.
+-- ==================================================================
+
+SELECT * FROM base_interacoes        ORDER BY dt_evento, contato_id;
+-- SELECT * FROM resumo_conversao       ORDER BY dt_evento, regiao, canal;
+-- SELECT * FROM produtividade_negociador ORDER BY dt_evento, nome_negociador;
+-- SELECT * FROM distribuicao_atraso    ORDER BY dt_evento, faixa_atraso;
+-- SELECT * FROM efetividade_regiao_canal ORDER BY dt_evento, regiao, canal;
+
+-- ==================================================================
+-- 9) Checagens de integridade (anti-joins úteis)
+-- ==================================================================
+/* Clientes presentes em contatos sem cadastro correspondente (ideal: 0) */
+-- SELECT DISTINCT ctn.doc_clean
+-- FROM contatos_norm ctn
+-- LEFT JOIN dim_clientes dc ON dc.doc_clean = ctn.doc_clean
+-- WHERE dc.doc_clean IS NULL;
+
+/* Negociadores em contatos sem cadastro correspondente (ideal: 0) */
+-- SELECT DISTINCT ctn.negociador_id
+-- FROM contatos_norm ctn
+-- LEFT JOIN dim_negociadores dn ON dn.negociador_id = ctn.negociador_id
+-- WHERE dn.negociador_id IS NULL;
+
+-- ==================================================================
+-- 10) Índices recomendados (ajuste sintaxe ao seu SGBD)
+-- ==================================================================
+/*
+-- PostgreSQL / MySQL
+CREATE INDEX idx_clientes_doc_clean      ON clientes (cpf_cnpj);
+CREATE INDEX idx_contatos_doc_clean      ON contatos (cpf_cnpj);
+CREATE INDEX idx_contatos_dt_evento      ON contatos (data_evento);
+CREATE INDEX idx_contatos_negociador     ON contatos (negociador_id);
+CREATE INDEX idx_contatos_tipo_evento    ON contatos (tipo_evento);
+
+-- SQL Server
+CREATE INDEX idx_clientes_doc_clean      ON dbo.clientes (cpf_cnpj);
+CREATE INDEX idx_contatos_doc_clean      ON dbo.contatos (cpf_cnpj);
+CREATE INDEX idx_contatos_dt_evento      ON dbo.contatos (data_evento);
+CREATE INDEX idx_contatos_negociador     ON dbo.contatos (negociador_id);
+CREATE INDEX idx_contatos_tipo_evento    ON dbo.contatos (tipo_evento);
+*/
+"""
+
+# Save the file
+path = "/mnt/data/query_integracao_cobranca.txt"
+with open(path, "w", encoding="utf-8") as f:
+    f.write(sql_text)
+
+path
+Resultado
+'/mnt/data/query_integracao_cobranca.txt'
+show! foquei no item 4 (Diferencial) e já te deixei uma query de integração pronta em formato .txt para você anexar na entrega.
+
+Baixar a query SQL (.txt)
+
+O que essa query faz
+Normaliza chaves (remove pontuações de CPF/CNPJ) para unir contatos ↔ clientes ↔ negociadores.
+
+Cria uma camada base base_interacoes com todos os campos necessários ao BI.
+
+Inclui flags por tipo de evento (fl_tentativa, fl_contato, fl_cpc, fl_promessa, fl_acordo) para facilitar medidas.
+
+Traz exemplos de resumos opcionais (conversão por tipo, produtividade por negociador, distribuição por atraso, efetividade por região/canal).
+
+Adiciona anti-joins de checagem e índices recomendados (comentados) para performance.
+
+É ANSI-SQL com observações para pequenos ajustes em Postgres/MySQL/SQL Server (schemas, tipos).
+
+Como usar na sua entrega
+Se quiser apenas a base integrada: descomente o bloco CREATE OR REPLACE VIEW vw_cobranca_interacoes e aponte seu Power BI para essa view.
+
+Se preferir fazer os cálculos no BI: mantenha apenas a vw_cobranca_interacoes e crie medidas DAX para as taxas.
+
+Se quiser já entregar agregados por SQL (não é obrigatório), use os SELECTs de exemplo nas CTEs resumo_conversao, produtividade_negociador, etc.
+
+Se você me mandar os nomes reais das tabelas/colunas (ou um print do esquema), eu adapto a query exatamente ao seu banco (incluindo cast de datas/currency, schemas e convenções de canal/faixa de atraso).
