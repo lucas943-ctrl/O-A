@@ -5,11 +5,13 @@ Transformações para a planilha da carteira:
 -Retirar horas em branco da coluna de data entrada - ok
 
 Transformações tabela eventos:
--Data evento ta como número trocar para date
+-Data evento ta como número trocar para date - ok
 
 Transformação promeça de pg:
--data promeça está como numero, trocar para data.
--Trocar null por 0 ou "não informado" na coluna valor prometido.
--status da promeça também tem nulls.
+-data promeça está como numero, trocar para data - ok
+-Trocar null por 0 ou "não informado" na coluna valor prometido - ok
+-status da promeça também tem nulls. 
 -Data de pagamento está como null e também está como número.
 -coluna obs também contem nulls
+
+Ainda não sei o que fazer com os nulls

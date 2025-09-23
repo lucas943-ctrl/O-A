@@ -1,0 +1,145 @@
+1) Preparação (recomendado)
+
+Garanta colunas básicas na sua planilha (ou crie no Power Query):
+ID, TipoEvento, Status (ex.: Vendido/Fechado vs Perdido/Em aberto), Negociador, Regiao, DataEvento, DataPrevista, DataReal (ou DataFechamento).
+
+Crie uma Tabela Calendário (Date Table) e relacione DataEvento (e/ou DataFechamento) a ela.
+
+Calendario =
+ADDCOLUMNS (
+  CALENDAR ( DATE(2023,1,1), DATE(2026,12,31) ),
+  "Ano", YEAR ( [Date] ),
+  "MesNum", MONTH ( [Date] ),
+  "Mes", FORMAT ( [Date], "MMM yyyy" )
+)
+
+
+Relacione Eventos[DataEvento] → Calendario[Date].
+
+2) Medidas base (genéricas)
+
+Supondo tabela de fatos Eventos:
+
+Total Eventos = COUNTROWS ( Eventos )
+
+Total Vendidos =
+CALCULATE ( [Total Eventos], Eventos[Status] IN {"Vendido","Fechado"} )
+
+Total Perdidos =
+CALCULATE ( [Total Eventos], Eventos[Status] IN {"Perdido","Cancelado"} )
+
+Taxa de Conversão =
+DIVIDE ( [Total Vendidos], [Total Eventos], 0 )
+
+3) Taxa de conversão por tipo de evento
+
+Use a medida Taxa de Conversão acima e coloque em um gráfico de colunas (ou barra). No eixo/legenda: Eventos[TipoEvento].
+Opcional: exibir também o volume:
+
+Eventos por Tipo = [Total Eventos]
+Vendidos por Tipo = [Total Vendidos]
+
+
+Visual: gráfico de barras clusterizadas com TipoEvento no eixo e Taxa de Conversão como valor (formato %). Adicione um rótulo de dados.
+
+4) Produtividade por negociador
+
+Defina produtividade como volume de atividades/vendas por período e/ou taxa de conversão por negociador:
+
+Eventos por Negociador = [Total Eventos]
+
+Vendas por Negociador = [Total Vendidos]
+
+Taxa Conversão por Negociador =
+DIVIDE ( [Vendas por Negociador], [Eventos por Negociador], 0 )
+
+-- Se tiver valores (receita):
+Receita Total = SUM ( Eventos[Valor] )
+
+Ticket Médio =
+DIVIDE ( [Receita Total], [Total Vendidos], 0 )
+
+-- Se quiser eventos/dia (produtividade temporal):
+Dias Úteis no Filtro =
+CALCULATE ( DISTINCTCOUNT ( Calendario[Date] ), ALLSELECTED ( Calendario ) )
+
+Eventos/Dia =
+DIVIDE ( [Total Eventos], [Dias Úteis no Filtro], 0 )
+
+
+Visual: matriz ou gráfico de barras com Negociador nas linhas e medidas Eventos por Negociador, Vendas por Negociador, Taxa Conversão por Negociador (e Ticket Médio, se fizer sentido).
+
+5) Distribuição por faixa de atraso
+
+Crie a coluna Dias de Atraso (se ainda não existir). Você pode fazer no Power Query ou como coluna calculada:
+
+Dias de Atraso =
+DATEDIFF ( Eventos[DataPrevista], Eventos[DataReal], DAY )
+
+
+Depois, crie a Faixa (bandas). Exemplo comum:
+
+Faixa de Atraso =
+VAR d = Eventos[Dias de Atraso]
+RETURN
+SWITCH (
+  TRUE(),
+  d <= 0, "No prazo / Adiantado",
+  d <= 7, "1-7 dias",
+  d <= 15, "8-15 dias",
+  d <= 30, "16-30 dias",
+  d <= 60, "31-60 dias",
+  d <= 90, "61-90 dias",
+  "90+ dias"
+)
+
+
+Agora é só plotar um gráfico de colunas com Faixa de Atraso no eixo e Total Eventos como valor (ou Total Vendidos se quiser a distribuição apenas de concluídos).
+Dica: ordene a coluna “Faixa de Atraso” por uma coluna de ordem (crie outra coluna numérica com 0,1,2,3… e use “Classificar por coluna”).
+
+6) Efetividade por região
+
+Normalmente “efetividade” = taxa de conversão por Regiao (você pode incluir qualidade via ticket médio ou SLA, se tiver).
+
+Eventos por Região = [Total Eventos]
+Vendas por Região = [Total Vendidos]
+
+Efetividade por Região =
+DIVIDE ( [Vendas por Região], [Eventos por Região], 0 )
+
+
+Visual:
+
+Mapa preenchido (Regiao no local, Efetividade por Região como valor)
+ou
+
+Gráfico de barras com Regiao no eixo e Efetividade por Região como valor (%).
+Se tiver Receita Total, adicione um gráfico secundário com Receita por Região e Ticket Médio.
+
+7) Slicers e boas práticas
+
+Crie slicers de Período (Calendario[Mes]), TipoEvento, Negociador e Regiao.
+
+Formate Taxas como porcentagem com 1 casa decimal.
+
+Padronize nomes (medidas com prefixo 🔹, por ex.) e use ALLSELECTED quando quiser que as medidas respeitem apenas os filtros do usuário no contexto atual.
+
+8) Exemplo rápido de página (layout)
+
+Linha superior: Slicers (Mês, Tipo de Evento, Região, Negociador).
+
+Coluna esquerda: Cartões com Total Eventos, Total Vendidos, Taxa de Conversão, Receita Total (se houver).
+
+Meio:
+
+Gráfico barras: Taxa de Conversão por Tipo de Evento
+
+Gráfico barras: Produtividade por Negociador (Eventos e Vendas lado a lado)
+
+Direita:
+
+Gráfico colunas: Distribuição por Faixa de Atraso
+
+Gráfico barras ou Mapa: Efetividade por Região
+
+Se quiser, me diga os nomes exatos das suas colunas (Status de venda, datas, valores, etc.) e eu ajusto as fórmulas DAX exatamente ao seu modelo — inclusive já te mando um conjunto de medidas pronto para copiar/colar.
