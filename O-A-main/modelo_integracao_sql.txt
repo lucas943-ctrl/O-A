@@ -1,0 +1,106 @@
+-- MODELO DE INTEGRAÇÃO ENTRE TABELAS RELACIONAIS (clientes, contatos, negociadores)
+-- Objetivo: demonstrar via SQL como unir as três tabelas para um dataset único.
+-- Entregável: este arquivo .txt com as queries de exemplo.
+--
+-- Assumimos os campos; ajuste se os nomes diferirem no seu banco:
+--   clientes(id_cliente PK, nome_cliente, id_negociador FK, status_cliente, criado_em)
+--   contatos(id_contato PK, id_cliente FK, email, telefone, eh_principal BOOLEAN, atualizado_em TIMESTAMP)
+--   negociadores(id_negociador PK, nome_negociador, email_negociador)
+--
+-- Estratégia principal: manter todos os clientes (LEFT JOIN) e escolher 1 contato "melhor":
+-- preferir contato principal (eh_principal = TRUE) e, em seguida, o mais recente (atualizado_em).
+
+/* ================================================================
+   CONSULTA 1 — UMA LINHA POR CLIENTE (pega o melhor contato)
+   ================================================================ */
+WITH contatos_rank AS (
+  SELECT
+    ct.*,
+    ROW_NUMBER() OVER (
+      PARTITION BY ct.id_cliente
+      ORDER BY
+        COALESCE(ct.eh_principal, FALSE) DESC,
+        COALESCE(ct.atualizado_em, TIMESTAMP '1900-01-01') DESC,
+        ct.id_contato DESC
+    ) AS rn
+  FROM contatos ct
+)
+SELECT
+  c.id_cliente,
+  c.nome_cliente,
+  n.id_negociador,
+  n.nome_negociador,
+  cr.email  AS email_contato,
+  cr.telefone AS telefone_contato
+FROM clientes c
+LEFT JOIN negociadores n
+  ON n.id_negociador = c.id_negociador
+LEFT JOIN contatos_rank cr
+  ON cr.id_cliente = c.id_cliente
+ AND cr.rn = 1
+-- WHERE c.status_cliente = 'ATIVO'    -- (opcional)
+;
+
+/* ================================================================
+   CONSULTA 2 — UMA LINHA POR CONTATO (sem deduplicar)
+   Útil para listar todos os contatos de cada cliente.
+   ================================================================ */
+SELECT
+  c.id_cliente,
+  c.nome_cliente,
+  n.nome_negociador,
+  ct.email,
+  ct.telefone,
+  ct.eh_principal,
+  ct.atualizado_em
+FROM clientes c
+LEFT JOIN negociadores n
+  ON n.id_negociador = c.id_negociador
+LEFT JOIN contatos ct
+  ON ct.id_cliente = c.id_cliente
+;
+
+/* ================================================================
+   CONSULTA 3 — AGREGAÇÃO DE CONTATOS EM UMA ÚNICA LINHA POR CLIENTE
+   Use a versão compatível com o seu SGBD.
+   ================================================================ */
+
+-- POSTGRES:
+SELECT
+  c.id_cliente,
+  c.nome_cliente,
+  n.nome_negociador,
+  STRING_AGG(DISTINCT ct.email, ', ')   AS emails,
+  STRING_AGG(DISTINCT ct.telefone, ', ') AS telefones
+FROM clientes c
+LEFT JOIN negociadores n
+  ON n.id_negociador = c.id_negociador
+LEFT JOIN contatos ct
+  ON ct.id_cliente = c.id_cliente
+GROUP BY 1,2,3
+;
+
+-- MYSQL/MariaDB:
+SELECT
+  c.id_cliente,
+  c.nome_cliente,
+  n.nome_negociador,
+  GROUP_CONCAT(DISTINCT ct.email SEPARATOR ', ')   AS emails,
+  GROUP_CONCAT(DISTINCT ct.telefone SEPARATOR ', ') AS telefones
+FROM clientes c
+LEFT JOIN negociadores n
+  ON n.id_negociador = c.id_negociador
+LEFT JOIN contatos ct
+  ON ct.id_cliente = c.id_cliente
+GROUP BY c.id_cliente, c.nome_cliente, n.nome_negociador
+;
+
+/* ================================================================
+   NOTAS / AJUSTES
+   1) LEFT JOIN preserva clientes mesmo sem contato.
+   2) Se seu SGBD não aceitar TIMESTAMP '1900-01-01', troque por uma data mínima suportada.
+   3) Índices recomendados: contatos(id_cliente), clientes(id_negociador), negociadores(id_negociador).
+   4) Se eh_principal for 'S'/'N' ou 1/0, ajuste o ORDER BY para ordenar corretamente.
+   5) Para filtrar um negociador específico, acrescente WHERE n.id_negociador = :id_negociador.
+   6) Para retornar mais colunas (ex.: status_cliente), inclua no SELECT da consulta principal.
+   ================================================================ */
