@@ -19,3 +19,5 @@ vou fazer um concat do nome do agente e da região para diferenciar os negociado
 taxa de conversão dos eventos fazer um funil com a conversão calculada respeitando as etapas para identificar gargalos
 
 adicionar taxa de conversão na faixa etária de atraso
+
+pivotei uma copia da tabela de eventos para criar uma planilha que mostre os indicadores do negociadores (igual os bi do dieguito)
