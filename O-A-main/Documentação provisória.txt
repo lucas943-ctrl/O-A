@@ -1,17 +1,21 @@
 Transformações para a planilha da carteira:
 -Trocar o "null" por "Nâo" - ok
 -Transformar o saldo devedor em moeda - ok
--criar coluna para faixa etaria(?) - ainda n sei
 -Retirar horas em branco da coluna de data entrada - ok
 
 Transformações tabela eventos:
 -Data evento ta como número trocar para date - ok
+-Numerar os tipos de evento em uma nova coluna para ajudar na ordenação do funil
 
-Transformação promeça de pg:
--data promeça está como numero, trocar para data - ok
+Transformação promessa de pg:
+-data promessa está como numero, trocar para data - ok
 -Trocar null por 0 ou "não informado" na coluna valor prometido - ok
--status da promeça também tem nulls. 
+-status da promessa também tem nulls. - coloquei os nulls como "Não cumprida"
 -Data de pagamento está como null e também está como número.
--coluna obs também contem nulls
+-coluna obs também contem nulls = coloquei os nulls como "Não informado"
 
-Ainda não sei o que fazer com os nulls
+vou fazer um concat do nome do agente e da região para diferenciar os negociadores. sistema não fornece sobrenome.
+
+taxa de conversão dos eventos fazer um funil com a conversão calculada respeitando as etapas para identificar gargalos
+
+adicionar taxa de conversão na faixa etária de atraso
