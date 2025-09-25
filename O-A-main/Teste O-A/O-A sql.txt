@@ -1,0 +1,14 @@
+SELECT 
+  c.ClienteId,
+  NULLIF(LTRIM(RTRIM(c.RazaoSocial)), '') AS RazaoSocial,
+  ct.ContatoId,
+  NULLIF(LTRIM(RTRIM(ct.NomeContato)), '') AS NomeContato,
+  n.NegociadorId,
+  NULLIF(LTRIM(RTRIM(n.NomeNegociador)), '') AS NomeNegociador
+FROM dbo.Clientes c
+LEFT JOIN dbo.Contatos ct
+       ON ct.ClienteId = c.ClienteId
+LEFT JOIN dbo.ClienteNegociador cn
+       ON cn.ClienteId = c.ClienteId
+LEFT JOIN dbo.Negociadores n
+       ON n.NegociadorId = cn.NegociadorId;
