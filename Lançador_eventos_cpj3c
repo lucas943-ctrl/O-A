@@ -1,0 +1,1428 @@
+import os
+import re
+import time
+import subprocess
+import logging
+from pathlib import Path
+from collections import Counter
+
+import pandas as pd
+import mysql.connector
+import pyautogui
+
+
+# =========================
+# ARQUIVOS / BANCO
+# =========================
+
+ARQUIVO_EXCEL = r"\\fs01\Cintia\Dados\Python\Lancador-de-eventos-BEA\PlanilhaAuxiliareventos.xlsx"
+
+DB_CONFIG = {
+    "host": "172.16.4.153",
+    "port": 3306,
+    "user": "lucas.rodrigues",
+    "password": "O&a2025pr0duc40",
+    "database": "cpjwcs",
+}
+
+QUERY = """
+SELECT
+  cp.pj,
+  cp.ficha,
+  cp.acao,
+  cp.valor_causa,
+  tg.descricao,
+  tg.caracteristicas
+FROM cad_processo cp
+LEFT JOIN cad_garantia_pro cg
+  ON cg.ficha = cp.ficha
+LEFT JOIN tab_garantia tg
+  ON tg.codigo = cg.codigo_garantia
+WHERE cp.acao = 'BEA'
+  AND cp.arquivo = 'N'
+  AND cp.incidente = 0
+  AND tg.codigo_gra_tipo IN (2,10,11,12,13,14)
+"""
+
+QUERY_EVENTOS_LANCADOS = """
+SELECT
+  cp.pj,
+  tt.evento,
+  tt.texto
+FROM tramitacao tt
+LEFT JOIN cad_processo cp
+  ON cp.pj = tt.id_processo
+LEFT JOIN cad_garantia_pro cg
+  ON cg.ficha = cp.ficha
+LEFT JOIN tab_garantia tg
+  ON tg.codigo = cg.codigo_garantia
+WHERE cp.acao = 'BEA'
+  AND cp.arquivo = 'N'
+  AND cp.incidente = 0
+  AND tg.codigo_gra_tipo IN (2,10,11,12,13,14)
+  AND tt.evento = 'VLSM'
+"""
+
+
+# =========================
+# FILTRO DE DATA
+# =========================
+
+DATA_INICIO_PROCESSAMENTO = "20/04/2026 00:00"
+
+
+# =========================
+# CPJ / AUTOMACAO
+# =========================
+
+APP_PATH = r"\\fs01\informatica$\PROGRAMA ADVOGADOS\2- CPJ\Client_Homolog\cpj3cclient.exe"
+
+USERNAME = "lucas.rodrigues"
+PASSWORD = "Oea2k25$bnu@LbG"
+
+TEMPO_ABERTURA_CPJ = 3
+TEMPO_POS_LOGIN = 3
+PAUSA = 0.25
+
+CONFIDENCE_TITULO = 0.70
+CONFIDENCE_CONFIRMA = 0.70
+CONFIDENCE_PASTINHA = 0.75
+CONFIDENCE_LEMBRETES = 0.75
+CONFIDENCE_CADASTRO_LEMBRETES = 0.75
+CONFIDENCE_TELA_PESQUISA_PJ = 0.75
+
+AJUSTE_X_BOTAO_SALVAR = -120
+AJUSTE_Y_BOTAO_SALVAR = -50
+
+AJUSTE_X_OBSERVACAO = 0.155
+AJUSTE_Y_OBSERVACAO = 0.215
+
+IMG_DIR = Path(r"\\fs01\Cintia\Dados\Python\Lancador-de-eventos-BEA\imgs")
+IMG_NOTIFICACAO_TITULO = IMG_DIR / "notificacao_titulo.png"
+IMG_ICONE_PASTINHA = IMG_DIR / "icone_pastinha.png"
+IMG_POPUP_CONFIRMA_TITULO = IMG_DIR / "popup_confirma_titulo.png"
+IMG_POPUP_LEMBRETES_TITULO = IMG_DIR / "popup_lembretes_titulo.png"
+IMG_POPUP_CADASTRO_LEMBRETES_TITULO = IMG_DIR / "popup_cadastro_lembretes_titulo.png"
+IMG_TELA_PESQUISA_PJ = IMG_DIR / "tela_pesquisa_pj.png"
+
+LOG_DIR = Path(r"C:\CPJ\logs")
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+LOG_FILE = LOG_DIR / f"automacao_cpj_{time.strftime('%Y%m%d_%H%M%S')}.log"
+
+VERSAO_SCRIPT = "2026-04-22 11:35 - valida-tela-antes-do-pj"
+
+pyautogui.PAUSE = PAUSA
+pyautogui.FAILSAFE = True
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
+)
+
+logging.getLogger("mysql").setLevel(logging.WARNING)
+logging.getLogger("mysql.connector").setLevel(logging.WARNING)
+
+
+# =========================
+# LOG
+# =========================
+
+def log_info(msg: str) -> None:
+    logging.info(msg)
+
+
+def log_erro(msg: str) -> None:
+    logging.error(msg)
+
+
+def log_tentativa(contexto: str, tentativa: int, total: int) -> None:
+    logging.info(f"{contexto} | tentativa {tentativa}/{total}")
+
+
+def abortar(msg: str) -> None:
+    log_erro(msg)
+    raise SystemExit(1)
+
+
+# =========================
+# UTIL
+# =========================
+
+def valor_texto(valor) -> str:
+    if pd.isna(valor):
+        return ""
+    texto = str(valor).strip()
+    if texto.lower() == "nan":
+        return ""
+    return texto
+
+
+def normalizar_texto(texto) -> str:
+    texto = valor_texto(texto).upper()
+    texto = re.sub(r"[^A-Z0-9]", "", texto)
+    return texto
+
+
+def normalizar_decimal(valor) -> str:
+    return valor_texto(valor).replace(",", ".")
+
+
+def converter_para_datetime(valor):
+    texto = valor_texto(valor)
+    if not texto:
+        return pd.NaT
+
+    formatos = [
+        "%d/%m/%Y %H:%M:%S",
+        "%d/%m/%Y %H:%M",
+        "%d/%m/%Y",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d",
+    ]
+
+    for formato in formatos:
+        try:
+            return pd.to_datetime(texto, format=formato, errors="raise")
+        except Exception:
+            pass
+
+    return pd.to_datetime(texto, errors="coerce", dayfirst=True)
+
+
+def formatar_data_evento(valor) -> str:
+    dt = converter_para_datetime(valor)
+
+    if pd.isna(dt):
+        return valor_texto(valor)
+
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def normalizar_data_hora_minuto(valor) -> str:
+    texto = valor_texto(valor)
+    if not texto:
+        return ""
+
+    dt = converter_para_datetime(texto)
+    if pd.isna(dt):
+        return texto[:16]
+
+    return dt.strftime("%Y-%m-%d %H:%M")
+
+
+def data_item_permitida(valor_data: str) -> bool:
+    data_inicio = converter_para_datetime(DATA_INICIO_PROCESSAMENTO)
+    data_item = converter_para_datetime(valor_data)
+
+    if pd.isna(data_inicio):
+        abortar(f"DATA_INICIO_PROCESSAMENTO invalida: {DATA_INICIO_PROCESSAMENTO}")
+
+    if pd.isna(data_item):
+        log_info(f"Linha ignorada por data_avistamento invalida/vazia: {valor_texto(valor_data)}")
+        return False
+
+    return data_item >= data_inicio
+
+
+def normalizar_nome_coluna(nome: str) -> str:
+    nome = str(nome).strip().lower()
+    nome = nome.replace("ã", "a").replace("á", "a").replace("à", "a").replace("â", "a")
+    nome = nome.replace("é", "e").replace("ê", "e")
+    nome = nome.replace("í", "i")
+    nome = nome.replace("ó", "o").replace("ô", "o").replace("õ", "o")
+    nome = nome.replace("ú", "u")
+    nome = nome.replace("ç", "c")
+    nome = re.sub(r"[^a-z0-9]+", "_", nome).strip("_")
+    return nome
+
+
+def normalizar_texto_exato_evento(texto) -> str:
+    texto = valor_texto(texto)
+
+    if not texto:
+        return ""
+
+    texto = texto.replace("\r\n", "\n").replace("\r", "\n")
+    texto = "\n".join(linha.rstrip() for linha in texto.split("\n"))
+    texto = texto.strip()
+
+    texto = texto.encode("ascii", "ignore").decode("ascii")
+
+    return texto.upper()
+
+
+def encontrar_coluna(df: pd.DataFrame, *nomes_possiveis: str) -> str:
+    mapa = {normalizar_nome_coluna(col): col for col in df.columns}
+
+    for nome in nomes_possiveis:
+        chave = normalizar_nome_coluna(nome)
+        if chave in mapa:
+            return mapa[chave]
+
+    raise ValueError(
+        f"Nao foi encontrada nenhuma das colunas esperadas {nomes_possiveis}. Colunas existentes: {list(df.columns)}"
+    )
+
+
+# =========================
+# EXCEL
+# =========================
+
+def carregar_excel(caminho_arquivo: str) -> pd.DataFrame:
+    if not os.path.exists(caminho_arquivo):
+        raise FileNotFoundError(f"Arquivo nao encontrado: {caminho_arquivo}")
+
+    if not os.access(caminho_arquivo, os.R_OK):
+        raise PermissionError(f"Sem permissao de leitura no arquivo: {caminho_arquivo}")
+
+    df = pd.read_excel(caminho_arquivo, engine="openpyxl")
+    df.columns = [str(col).strip() for col in df.columns]
+
+    col_placa = encontrar_coluna(df, "placa")
+    col_data = encontrar_coluna(df, "data avistamento", "data_avistamento", "data/hora", "data hora")
+    col_sigla = encontrar_coluna(df, "sigla")
+    col_logradouro = encontrar_coluna(df, "logradouro")
+    col_numero = encontrar_coluna(df, "numero", "número")
+    col_bairro = encontrar_coluna(df, "bairro")
+    col_cidade = encontrar_coluna(df, "cidade")
+    col_latitude = encontrar_coluna(df, "latitude")
+    col_longitude = encontrar_coluna(df, "longitude")
+    col_localizador = encontrar_coluna(df, "localizador")
+    col_email = encontrar_coluna(df, "email", "e-mail")
+    col_whatsapp = encontrar_coluna(df, "whatsapp", "telefone", "celular")
+
+    df_result = pd.DataFrame({
+        "placa": df[col_placa].apply(valor_texto),
+        "data_avistamento": df[col_data].apply(valor_texto),
+        "sigla": df[col_sigla].apply(valor_texto),
+        "logradouro": df[col_logradouro].apply(valor_texto),
+        "numero": df[col_numero].apply(valor_texto),
+        "bairro": df[col_bairro].apply(valor_texto),
+        "cidade": df[col_cidade].apply(valor_texto),
+        "latitude": df[col_latitude].apply(normalizar_decimal),
+        "longitude": df[col_longitude].apply(normalizar_decimal),
+        "localizador": df[col_localizador].apply(valor_texto),
+        "email": df[col_email].apply(valor_texto),
+        "whatsapp": df[col_whatsapp].apply(valor_texto),
+    })
+
+    df_result["placa_normalizada"] = df_result["placa"].apply(normalizar_texto)
+    return df_result
+
+
+def remover_avistamentos_duplicados(df_excel: pd.DataFrame) -> pd.DataFrame:
+    df = df_excel.copy()
+
+    df["chave_avistamento"] = (
+        df["placa_normalizada"].apply(valor_texto)
+        + "|"
+        + df["data_avistamento"].apply(normalizar_data_hora_minuto)
+    )
+
+    total_antes = len(df)
+    df = df.drop_duplicates(subset=["chave_avistamento"], keep="first").copy()
+    total_depois = len(df)
+    total_removidos = total_antes - total_depois
+
+    log_info(
+        f"Avistamentos duplicados removidos: {total_removidos} | antes={total_antes} | depois={total_depois}"
+    )
+
+    return df.drop(columns=["chave_avistamento"])
+
+
+# =========================
+# BANCO
+# =========================
+
+def carregar_dados_banco() -> pd.DataFrame:
+    conn = mysql.connector.connect(**DB_CONFIG)
+    cursor = conn.cursor(dictionary=True)
+
+    try:
+        cursor.execute(QUERY)
+        dados = cursor.fetchall()
+    finally:
+        cursor.close()
+        conn.close()
+
+    df = pd.DataFrame(dados)
+
+    if df.empty:
+        df = pd.DataFrame(columns=[
+            "pj", "ficha", "acao", "valor_causa", "descricao", "caracteristicas"
+        ])
+
+    if "caracteristicas" not in df.columns:
+        df["caracteristicas"] = ""
+
+    df["caracteristicas"] = df["caracteristicas"].fillna("").astype(str)
+    df["caracteristicas_normalizada"] = df["caracteristicas"].apply(normalizar_texto)
+
+    return df
+
+
+def carregar_eventos_lancados() -> pd.DataFrame:
+    conn = mysql.connector.connect(**DB_CONFIG)
+    cursor = conn.cursor(dictionary=True)
+
+    try:
+        cursor.execute(QUERY_EVENTOS_LANCADOS)
+        dados = cursor.fetchall()
+    finally:
+        cursor.close()
+        conn.close()
+
+    df = pd.DataFrame(dados)
+
+    if df.empty:
+        df = pd.DataFrame(columns=["pj", "evento", "texto"])
+
+    if "texto" not in df.columns:
+        df["texto"] = ""
+
+    df["pj"] = df["pj"].apply(valor_texto)
+    df["evento"] = df["evento"].apply(valor_texto)
+    df["texto_comparacao"] = df["texto"].apply(normalizar_texto_exato_evento)
+
+    chaves = [
+        (valor_texto(linha["pj"]), valor_texto(linha["texto_comparacao"]))
+        for _, linha in df.iterrows()
+        if valor_texto(linha["pj"]) and valor_texto(linha["texto_comparacao"])
+    ]
+
+    total_chaves_unicas = len(set(chaves))
+
+    log_info(
+        f"Total de eventos lancados carregados do banco: {len(df)} | "
+        f"chaves_unicas_pj_texto={total_chaves_unicas}"
+    )
+
+    duplicados = (
+        df.groupby(["pj", "texto_comparacao"])
+        .size()
+        .reset_index(name="qtd")
+        .sort_values(["qtd", "pj"], ascending=[False, True])
+    )
+
+    duplicados_reais = duplicados[duplicados["qtd"] > 1].copy()
+
+    if not duplicados_reais.empty:
+        top = duplicados_reais.head(20)
+        resumo = " | ".join(
+            f"pj={valor_texto(linha['pj'])} qtd={int(linha['qtd'])}"
+            for _, linha in top.iterrows()
+        )
+        log_info(
+            f"Eventos lancados repetidos na query (top 20): {resumo} | "
+            f"total_repetidos={len(duplicados_reais)}"
+        )
+
+    return df
+
+
+# =========================
+# MONTAGEM DOS ITENS
+# =========================
+
+def montar_itens(df_excel: pd.DataFrame, df_query: pd.DataFrame) -> list[dict]:
+    itens = []
+    placas_sem_pj: dict[str, int] = {}
+    placas_match_sem_pj: dict[str, int] = {}
+    ignoradas_por_data = 0
+
+    for _, linha_excel in df_excel.iterrows():
+        placa_normalizada = linha_excel["placa_normalizada"]
+        placa_original = valor_texto(linha_excel["placa"])
+        data_avistamento = valor_texto(linha_excel["data_avistamento"])
+
+        if not placa_normalizada:
+            continue
+
+        if not data_item_permitida(data_avistamento):
+            ignoradas_por_data += 1
+            continue
+
+        matches = df_query[
+            df_query["caracteristicas_normalizada"].str.contains(
+                placa_normalizada,
+                na=False,
+                regex=False
+            )
+        ].copy()
+
+        if matches.empty:
+            placas_sem_pj[placa_original] = placas_sem_pj.get(placa_original, 0) + 1
+            continue
+
+        encontrou_pj_valido = False
+
+        for _, match in matches.iterrows():
+            pj = valor_texto(match.get("pj", ""))
+
+            if not pj:
+                continue
+
+            encontrou_pj_valido = True
+
+            item = {
+                "pj": pj,
+                "placa": placa_original,
+                "data_avistamento": data_avistamento,
+                "sigla": valor_texto(linha_excel["sigla"]),
+                "logradouro": valor_texto(linha_excel["logradouro"]),
+                "numero": valor_texto(linha_excel["numero"]),
+                "bairro": valor_texto(linha_excel["bairro"]),
+                "cidade": valor_texto(linha_excel["cidade"]),
+                "latitude": normalizar_decimal(linha_excel["latitude"]),
+                "longitude": normalizar_decimal(linha_excel["longitude"]),
+                "localizador": valor_texto(linha_excel["localizador"]),
+                "email": valor_texto(linha_excel["email"]),
+                "whatsapp": valor_texto(linha_excel["whatsapp"]),
+            }
+
+            itens.append(item)
+
+        if not encontrou_pj_valido:
+            placas_match_sem_pj[placa_original] = placas_match_sem_pj.get(placa_original, 0) + 1
+
+    log_info(f"Linhas ignoradas por filtro de data em montar_itens: {ignoradas_por_data}")
+
+    total_sem_pj = sum(placas_sem_pj.values())
+    total_match_sem_pj = sum(placas_match_sem_pj.values())
+
+    if total_sem_pj:
+        top_sem_pj = sorted(placas_sem_pj.items(), key=lambda x: (-x[1], x[0]))[:20]
+        resumo = ", ".join(f"{placa} ({qtd})" for placa, qtd in top_sem_pj)
+        log_info(
+            f"Linhas sem PJ encontrado: {total_sem_pj} | placas unicas={len(placas_sem_pj)} | top20={resumo}"
+        )
+
+    if total_match_sem_pj:
+        top_match_sem_pj = sorted(placas_match_sem_pj.items(), key=lambda x: (-x[1], x[0]))[:20]
+        resumo = ", ".join(f"{placa} ({qtd})" for placa, qtd in top_match_sem_pj)
+        log_info(
+            f"Matches sem PJ valido: {total_match_sem_pj} | placas unicas={len(placas_match_sem_pj)} | top20={resumo}"
+        )
+
+    return itens
+
+
+def remover_itens_duplicados(itens: list[dict]) -> list[dict]:
+    vistos = set()
+    itens_unicos = []
+
+    for item in itens:
+        chave = (
+            valor_texto(item.get("pj")),
+            valor_texto(item.get("placa")),
+            valor_texto(item.get("sigla")),
+            normalizar_data_hora_minuto(item.get("data_avistamento")),
+        )
+
+        if chave in vistos:
+            continue
+
+        vistos.add(chave)
+        itens_unicos.append(item)
+
+    removidos = len(itens) - len(itens_unicos)
+    log_info(
+        f"Itens duplicados removidos para automacao: {removidos} | antes={len(itens)} | depois={len(itens_unicos)}"
+    )
+    return itens_unicos
+
+
+def montar_observacao_evento(item: dict) -> str:
+    campos = [
+        ("Placa", valor_texto(item["placa"])),
+        ("Data avistamento", formatar_data_evento(item["data_avistamento"])),
+        ("Logradouro", valor_texto(item["logradouro"])),
+        ("Numero", valor_texto(item["numero"])),
+        ("Bairro", valor_texto(item["bairro"])),
+        ("Cidade", valor_texto(item["cidade"])),
+        ("Latitude", normalizar_decimal(item["latitude"])),
+        ("Longitude", normalizar_decimal(item["longitude"])),
+        ("Localizador", valor_texto(item["localizador"])),
+        ("Email", valor_texto(item["email"])),
+        ("Whatsapp", valor_texto(item["whatsapp"])),
+    ]
+
+    linhas = []
+    for nome, valor in campos:
+        linhas.append(f"| {nome}: {valor}")
+
+    return "\n".join(linhas)
+
+
+def remover_itens_ja_lancados(itens: list[dict], df_eventos_lancados: pd.DataFrame) -> list[dict]:
+    if not itens:
+        return itens
+
+    if df_eventos_lancados.empty:
+        log_info("Nenhum evento anterior encontrado no banco para validacao.")
+        return itens
+
+    chaves_existentes = set()
+
+    for _, linha in df_eventos_lancados.iterrows():
+        pj = valor_texto(linha.get("pj"))
+        texto = valor_texto(linha.get("texto_comparacao"))
+
+        if pj and texto:
+            chaves_existentes.add((pj, texto))
+
+    total_itens_com_chave = 0
+    total_matches = 0
+    itens_filtrados = []
+    exemplos_ignorados = 0
+    exemplos_nao_match = 0
+
+    for item in itens:
+        pj = valor_texto(item.get("pj"))
+        texto_montado = montar_observacao_evento(item)
+        texto_montado_cmp = normalizar_texto_exato_evento(texto_montado)
+
+        if pj and texto_montado_cmp:
+            total_itens_com_chave += 1
+
+        chave_item = (pj, texto_montado_cmp)
+
+        if chave_item in chaves_existentes:
+            total_matches += 1
+
+            if exemplos_ignorados < 20:
+                log_info(
+                    f"Item ignorado por ja estar lancado | "
+                    f"pj={pj} | placa={valor_texto(item.get('placa'))} | sigla={valor_texto(item.get('sigla'))}"
+                )
+                exemplos_ignorados += 1
+
+            continue
+
+        if exemplos_nao_match < 10:
+            mesmos_pjs = df_eventos_lancados[df_eventos_lancados["pj"] == pj].copy()
+
+            if not mesmos_pjs.empty:
+                log_info(
+                    f"NAO_MATCH_COM_PJ_EXISTENTE | "
+                    f"pj={pj} | placa={valor_texto(item.get('placa'))} | sigla={valor_texto(item.get('sigla'))}"
+                )
+                log_info(f"TEXTO_ITEM >>> {texto_montado_cmp}")
+
+                for idx, (_, linha_pj) in enumerate(mesmos_pjs.head(3).iterrows(), start=1):
+                    log_info(f"TEXTO_BANCO_{idx} >>> {valor_texto(linha_pj.get('texto_comparacao'))}")
+
+                exemplos_nao_match += 1
+
+        itens_filtrados.append(item)
+
+    log_info(
+        f"Resumo validacao ja lancados | "
+        f"itens_com_chave={total_itens_com_chave} | "
+        f"chaves_existentes={len(chaves_existentes)} | "
+        f"matches={total_matches} | "
+        f"antes={len(itens)} | depois={len(itens_filtrados)}"
+    )
+
+    return itens_filtrados
+
+
+# =========================
+# VALIDACOES
+# =========================
+
+def validar_credenciais() -> None:
+    if not USERNAME.strip():
+        abortar("USERNAME vazio.")
+    if not PASSWORD.strip():
+        abortar("PASSWORD vazio.")
+
+
+def validar_itens(itens: list[dict]) -> None:
+    if not itens:
+        abortar("A lista de itens esta vazia apos cruzar planilha com banco.")
+
+    campos_necessarios = [
+        "pj",
+        "placa",
+        "data_avistamento",
+        "sigla",
+    ]
+
+    for i, item in enumerate(itens, start=1):
+        for campo in campos_necessarios:
+            if campo not in item:
+                abortar(f"Item {i} nao contem a chave '{campo}'.")
+            if not valor_texto(item[campo]):
+                abortar(f"Item {i} possui o campo obrigatorio '{campo}' vazio.")
+
+
+def validar_arquivos() -> None:
+    for arquivo in [
+        IMG_NOTIFICACAO_TITULO,
+        IMG_ICONE_PASTINHA,
+        IMG_POPUP_CONFIRMA_TITULO,
+        IMG_POPUP_LEMBRETES_TITULO,
+        IMG_POPUP_CADASTRO_LEMBRETES_TITULO,
+        IMG_TELA_PESQUISA_PJ,
+    ]:
+        if not arquivo.exists():
+            abortar(f"Arquivo nao encontrado: {arquivo}")
+        if arquivo.stat().st_size == 0:
+            abortar(f"Arquivo vazio: {arquivo}")
+    log_info("Imagens OK")
+
+
+# =========================
+# AUTOMACAO
+# =========================
+
+def screenshot_debug(nome: str) -> None:
+    try:
+        destino = LOG_DIR / f"{nome}_{time.strftime('%Y%m%d_%H%M%S')}.png"
+        pyautogui.screenshot(str(destino))
+        log_info(f"Screenshot salvo em: {destino}")
+    except Exception as e:
+        log_erro(f"Falha ao salvar screenshot de debug: {e}")
+
+
+def abrir_cpj() -> None:
+    log_info(f"Abrindo CPJ: {APP_PATH}")
+
+    if not Path(APP_PATH).exists():
+        abortar(f"Executavel do CPJ nao encontrado: {APP_PATH}")
+
+    subprocess.Popen(APP_PATH)
+    time.sleep(TEMPO_ABERTURA_CPJ)
+
+
+def pressionar(tecla: str, desc: str = "") -> None:
+    try:
+        pyautogui.press(tecla)
+        time.sleep(0.2)
+    except Exception as e:
+        detalhe = f" | {desc}" if desc else ""
+        log_erro(f"Falha ao pressionar tecla '{tecla}'{detalhe}: {e}")
+        raise
+
+
+def digitar(texto: str, ocultar: bool = False) -> None:
+    try:
+        pyautogui.write(str(texto), interval=0.03)
+        time.sleep(0.3)
+    except Exception as e:
+        exibicao = "***" if ocultar else str(texto)
+        log_erro(f"Falha ao digitar '{exibicao}': {e}")
+        raise
+
+
+def limpar() -> None:
+    try:
+        pyautogui.hotkey("ctrl", "a")
+        time.sleep(0.2)
+        pyautogui.press("backspace")
+        time.sleep(0.2)
+    except Exception as e:
+        log_erro(f"Falha ao limpar campo: {e}")
+        raise
+
+
+def mover_xy(x: int, y: int, desc: str = "") -> None:
+    try:
+        pyautogui.moveTo(x, y, duration=0.8)
+        time.sleep(0.5)
+    except Exception as e:
+        detalhe = f" | {desc}" if desc else ""
+        log_erro(f"Falha ao mover mouse para x={x}, y={y}{detalhe}: {e}")
+        raise
+
+
+def clicar_xy(x: int, y: int, desc: str = "") -> None:
+    try:
+        pyautogui.click(x, y)
+        time.sleep(0.4)
+    except Exception as e:
+        detalhe = f" | {desc}" if desc else ""
+        log_erro(f"Falha no clique em x={x}, y={y}{detalhe}: {e}")
+        raise
+
+
+def duplo_clique_xy(x: int, y: int, desc: str = "") -> None:
+    try:
+        pyautogui.doubleClick(x, y)
+        time.sleep(0.5)
+    except Exception as e:
+        detalhe = f" | {desc}" if desc else ""
+        log_erro(f"Falha no duplo clique em x={x}, y={y}{detalhe}: {e}")
+        raise
+
+
+def localizar_box(
+    img: Path,
+    desc: str,
+    timeout: int = 10,
+    confidence: float = 0.70,
+    region=None,
+):
+    fim = time.time() + timeout
+    ultimo_erro = None
+    tentativa = 0
+
+    try:
+        import cv2  # noqa: F401
+        tem_opencv = True
+    except Exception:
+        tem_opencv = False
+
+    while time.time() < fim:
+        tentativa += 1
+        log_tentativa(f"Localizando box: {desc}", tentativa, max(1, int(timeout / 0.4)))
+
+        try:
+            kwargs = {
+                "image": str(img),
+                "grayscale": True,
+                "region": region,
+            }
+            if tem_opencv:
+                kwargs["confidence"] = confidence
+
+            box = pyautogui.locateOnScreen(**kwargs)
+
+            if box:
+                log_info(
+                    f"Box localizado: {desc} | left={box.left}, top={box.top}, width={box.width}, height={box.height}"
+                )
+                return box
+
+        except pyautogui.ImageNotFoundException as e:
+            ultimo_erro = e
+        except Exception as e:
+            ultimo_erro = e
+
+        time.sleep(0.4)
+
+    log_info(f"Box nao localizado: {desc} | erro={ultimo_erro}")
+    return None
+
+
+def localizar_ponto(
+    img: Path,
+    desc: str,
+    timeout: int = 10,
+    confidence: float = 0.70,
+    region=None,
+):
+    fim = time.time() + timeout
+    ultimo_erro = None
+    tentativa = 0
+
+    try:
+        import cv2  # noqa: F401
+        tem_opencv = True
+    except Exception:
+        tem_opencv = False
+
+    while time.time() < fim:
+        tentativa += 1
+        log_tentativa(f"Localizando ponto: {desc}", tentativa, max(1, int(timeout / 0.4)))
+
+        try:
+            kwargs = {
+                "image": str(img),
+                "grayscale": True,
+                "region": region,
+            }
+            if tem_opencv:
+                kwargs["confidence"] = confidence
+
+            ponto = pyautogui.locateCenterOnScreen(**kwargs)
+
+            if ponto:
+                log_info(f"Ponto localizado: {desc} | x={ponto.x}, y={ponto.y}")
+                return ponto
+
+        except pyautogui.ImageNotFoundException as e:
+            ultimo_erro = e
+        except Exception as e:
+            ultimo_erro = e
+
+        time.sleep(0.4)
+
+    log_info(f"Ponto nao localizado: {desc} | erro={ultimo_erro}")
+    return None
+
+
+def fazer_login() -> None:
+    log_info("Iniciando login")
+
+    limpar()
+    digitar(USERNAME)
+
+    pressionar("tab", "ir para senha")
+    limpar()
+    digitar(PASSWORD, True)
+
+    pressionar("tab", "ir para OK")
+    pressionar("enter", "confirmar login")
+
+    log_info("Login enviado")
+    time.sleep(TEMPO_POS_LOGIN)
+
+
+def obter_regiao_popup():
+    screen_w, screen_h = pyautogui.size()
+    regiao = (
+        int(screen_w * 0.10),
+        int(screen_h * 0.05),
+        int(screen_w * 0.80),
+        int(screen_h * 0.80),
+    )
+    return regiao
+
+
+def aguardar_popup(img_titulo: Path, desc: str, confidence: float, timeout: int = 8) -> bool:
+    tentativas_totais = max(1, int(timeout / 1.5))
+
+    for tentativa in range(1, tentativas_totais + 1):
+        log_tentativa(f"Aguardando popup '{desc}'", tentativa, tentativas_totais)
+
+        box = localizar_box(
+            img_titulo,
+            f"espera do popup: {desc}",
+            timeout=1,
+            confidence=confidence,
+            region=obter_regiao_popup(),
+        )
+        if box:
+            log_info(f"Popup '{desc}' apareceu.")
+            return True
+
+        time.sleep(0.5)
+
+    log_info(f"Popup '{desc}' nao apareceu dentro do tempo limite.")
+    return False
+
+
+def popup_ainda_visivel(img_titulo: Path, desc: str, confidence: float) -> bool:
+    box = localizar_box(
+        img_titulo,
+        f"validacao de permanencia do popup: {desc}",
+        timeout=2,
+        confidence=confidence,
+        region=obter_regiao_popup(),
+    )
+    return box is not None
+
+
+def fechar_notificacao_por_ancora() -> bool:
+    log_info("Tentando fechar popup de notificacao")
+
+    titulo = localizar_box(
+        IMG_NOTIFICACAO_TITULO,
+        "titulo notificacao",
+        timeout=2,
+        confidence=CONFIDENCE_TITULO,
+        region=obter_regiao_popup(),
+    )
+
+    if not titulo:
+        log_info("Popup de notificacao nao esta visivel para fechamento.")
+        return False
+
+    popup_left = titulo.left
+    popup_top = titulo.top
+    popup_width = 700
+    popup_height = 420
+
+    x_fechar = popup_left + int(popup_width * 0.75)
+    y_fechar = popup_top + int(popup_height * 0.80)
+
+    mover_xy(x_fechar, y_fechar, "posicionar no Fechar notificacao")
+    clicar_xy(x_fechar, y_fechar, "Fechar notificacao")
+    time.sleep(1)
+
+    if popup_ainda_visivel(IMG_NOTIFICACAO_TITULO, "notificacao", CONFIDENCE_TITULO):
+        log_erro(
+            f"Falha ao fechar popup de notificacao | clique x={x_fechar}, y={y_fechar}"
+        )
+        screenshot_debug("popup_notificacao_ainda_visivel")
+        return False
+
+    return True
+
+
+def tratar_popup_confirma() -> bool:
+    log_info("Tentando tratar popup 'Confirma'")
+
+    titulo = localizar_box(
+        IMG_POPUP_CONFIRMA_TITULO,
+        "popup confirma",
+        timeout=2,
+        confidence=CONFIDENCE_CONFIRMA,
+        region=obter_regiao_popup(),
+    )
+
+    if not titulo:
+        log_info("Popup 'Confirma' nao esta visivel para tratamento.")
+        return False
+
+    popup_left = titulo.left
+    popup_top = titulo.top
+    popup_width = 640
+    popup_height = 220
+
+    x_nao = popup_left + int(popup_width * 0.50)
+    y_nao = popup_top + int(popup_height * 0.50)
+
+    mover_xy(x_nao, y_nao, "posicionar no botao Nao")
+    clicar_xy(x_nao, y_nao, "botao Nao do popup Confirma")
+    time.sleep(1)
+
+    if popup_ainda_visivel(IMG_POPUP_CONFIRMA_TITULO, "confirma", CONFIDENCE_CONFIRMA):
+        log_erro(
+            f"Falha ao tratar popup 'Confirma' | clique x={x_nao}, y={y_nao}"
+        )
+        screenshot_debug("popup_confirma_ainda_visivel")
+        return False
+
+    return True
+
+
+def tratar_popup_lembretes() -> bool:
+    log_info("Verificando popup 'Lembretes'")
+
+    titulo = localizar_box(
+        IMG_POPUP_LEMBRETES_TITULO,
+        "popup lembretes",
+        timeout=2,
+        confidence=CONFIDENCE_LEMBRETES,
+        region=obter_regiao_popup(),
+    )
+
+    if not titulo:
+        log_info("Popup 'Lembretes' nao apareceu.")
+        return False
+
+    pressionar("esc", "fechar popup Lembretes")
+    time.sleep(1)
+
+    if localizar_box(
+        IMG_POPUP_LEMBRETES_TITULO,
+        "popup lembretes ainda visivel",
+        timeout=1,
+        confidence=CONFIDENCE_LEMBRETES,
+        region=obter_regiao_popup(),
+    ):
+        log_erro("Falha ao fechar popup 'Lembretes' com ESC")
+        screenshot_debug("popup_lembretes_ainda_visivel")
+        return False
+
+    return True
+
+
+def tratar_popup_cadastro_lembretes() -> bool:
+    log_info("Verificando popup 'Cadastro de Processos - Lembretes'")
+
+    titulo = localizar_box(
+        IMG_POPUP_CADASTRO_LEMBRETES_TITULO,
+        "popup cadastro lembretes",
+        timeout=2,
+        confidence=CONFIDENCE_CADASTRO_LEMBRETES,
+        region=obter_regiao_popup(),
+    )
+
+    if not titulo:
+        log_info("Popup 'Cadastro de Processos - Lembretes' nao apareceu.")
+        return False
+
+    try:
+        pressionar("enter", "fechar popup Cadastro de Processos - Lembretes")
+        time.sleep(1)
+
+        ainda_visivel = localizar_box(
+            IMG_POPUP_CADASTRO_LEMBRETES_TITULO,
+            "popup cadastro lembretes ainda visivel",
+            timeout=1,
+            confidence=CONFIDENCE_CADASTRO_LEMBRETES,
+            region=obter_regiao_popup(),
+        )
+
+        if not ainda_visivel:
+            log_info("Popup 'Cadastro de Processos - Lembretes' fechado com ENTER.")
+            return True
+
+    except Exception as e:
+        log_info(f"ENTER nao fechou o popup de cadastro lembretes: {e}")
+
+    try:
+        popup_left = titulo.left
+        popup_top = titulo.top
+        popup_width = 610
+        popup_height = 330
+
+        x_ok = popup_left + int(popup_width * 0.68)
+        y_ok = popup_top + int(popup_height * 0.75)
+
+        mover_xy(x_ok, y_ok, "botao OK popup cadastro lembretes")
+        clicar_xy(x_ok, y_ok, "botao OK popup cadastro lembretes")
+        time.sleep(1)
+
+        ainda_visivel = localizar_box(
+            IMG_POPUP_CADASTRO_LEMBRETES_TITULO,
+            "popup cadastro lembretes ainda visivel apos clique",
+            timeout=1,
+            confidence=CONFIDENCE_CADASTRO_LEMBRETES,
+            region=obter_regiao_popup(),
+        )
+
+        if not ainda_visivel:
+            log_info("Popup 'Cadastro de Processos - Lembretes' fechado com clique no OK.")
+            return True
+
+    except Exception as e:
+        log_erro(f"Falha ao clicar no OK do popup cadastro lembretes: {e}")
+
+    log_erro("Falha ao fechar popup 'Cadastro de Processos - Lembretes'.")
+    screenshot_debug("popup_cadastro_lembretes_ainda_visivel")
+    return False
+
+
+def clicar_icone_pastinha() -> bool:
+    log_info("Tentando localizar e clicar no icone da pastinha")
+
+    screen_w, screen_h = pyautogui.size()
+    regiao_barra_lateral = (
+        0,
+        int(screen_h * 0.05),
+        int(screen_w * 0.12),
+        int(screen_h * 0.90),
+    )
+
+    ponto = localizar_ponto(
+        IMG_ICONE_PASTINHA,
+        "icone pastinha",
+        timeout=8,
+        confidence=CONFIDENCE_PASTINHA,
+        region=regiao_barra_lateral,
+    )
+
+    if not ponto:
+        screenshot_debug("nao_achou_icone_pastinha")
+        return False
+
+    mover_xy(ponto.x, ponto.y, "posicionar no icone da pastinha")
+    clicar_xy(ponto.x, ponto.y, "icone da pastinha")
+    time.sleep(1)
+    return True
+
+
+def validar_tela_pesquisa_pj() -> None:
+    log_info("Validando se esta na tela correta antes de digitar o PJ")
+
+    screen_w, screen_h = pyautogui.size()
+    regiao_busca = (
+        0,
+        0,
+        int(screen_w * 0.45),
+        int(screen_h * 0.25),
+    )
+
+    box = localizar_box(
+        IMG_TELA_PESQUISA_PJ,
+        "tela de pesquisa do processo",
+        timeout=2,
+        confidence=CONFIDENCE_TELA_PESQUISA_PJ,
+        region=regiao_busca,
+    )
+
+    if box:
+        log_info("Tela de pesquisa do processo confirmada.")
+        return
+
+    screenshot_debug("tela_pesquisa_pj_nao_confirmada")
+    abortar("Falha critica: tela de pesquisa do processo nao confirmada antes de digitar o PJ.")
+
+
+def clicar_campo_numero_processo() -> None:
+    screen_w, screen_h = pyautogui.size()
+    x_campo = int(screen_w * 0.22)
+    y_campo = int(screen_h * 0.110)
+
+    mover_xy(x_campo, y_campo, "campo numero do processo ao lado de PJ")
+    duplo_clique_xy(x_campo, y_campo, "campo numero do processo ao lado de PJ")
+    time.sleep(0.5)
+
+
+def pesquisar_processo(numero_processo: str) -> bool:
+    log_info(f"Iniciando pesquisa do processo: {numero_processo}")
+
+    validar_tela_pesquisa_pj()
+
+    clicar_campo_numero_processo()
+    limpar()
+    digitar(numero_processo)
+
+    pressionar("enter", f"pesquisar processo {numero_processo}")
+    time.sleep(1.5)
+
+    pressionar("enter", f"abrir processo {numero_processo}")
+    time.sleep(2)
+    return True
+
+
+def abrir_novo_evento() -> bool:
+    log_info("Abrindo novo evento pela tecla Insert")
+    pressionar("insert", "abrir novo evento")
+    time.sleep(1.5)
+    return True
+
+
+def preencher_sigla_evento(sigla_evento: str) -> bool:
+    log_info(f"Preenchendo sigla do evento: {sigla_evento}")
+
+    time.sleep(0.5)
+    limpar()
+    digitar(sigla_evento)
+
+    time.sleep(1)
+    pressionar("enter", f"filtrar sigla {sigla_evento}")
+    time.sleep(1.5)
+    pressionar("enter", f"confirmar evento {sigla_evento}")
+    time.sleep(2)
+    return True
+
+
+def digitar_multilinha(texto: str) -> None:
+    linhas = texto.split("\n")
+
+    for i, linha in enumerate(linhas):
+        try:
+            pyautogui.write(linha, interval=0.02)
+
+            if i < len(linhas) - 1:
+                pyautogui.press("enter")
+                time.sleep(0.1)
+
+        except pyautogui.FailSafeException:
+            log_erro("PyAutoGUI fail-safe acionado durante digitacao multiline.")
+            screenshot_debug("failsafe_digitar_multilinha")
+            raise
+
+        except Exception as e:
+            log_erro(f"Falha ao digitar texto multiline: {e}")
+            screenshot_debug("erro_digitar_multilinha")
+            raise
+
+
+def preencher_observacao_evento(texto_observacao: str) -> bool:
+    log_info("Preenchendo campo de observacao do evento")
+
+    screen_w, screen_h = pyautogui.size()
+    x_observacao = int(screen_w * AJUSTE_X_OBSERVACAO)
+    y_observacao = int(screen_h * AJUSTE_Y_OBSERVACAO)
+
+    mover_xy(x_observacao, y_observacao, "campo observacao do evento")
+    clicar_xy(x_observacao, y_observacao, "campo observacao do evento")
+
+    limpar()
+    digitar_multilinha(texto_observacao)
+    time.sleep(0.8)
+    return True
+
+
+def clicar_botao_salvar() -> bool:
+    log_info("Tentando acionar botao Salvar")
+
+    screen_w, screen_h = pyautogui.size()
+    x_base = int(screen_w * 0.985)
+    y_base = int(screen_h * 0.955)
+
+    x_salvar = x_base + AJUSTE_X_BOTAO_SALVAR
+    y_salvar = y_base + AJUSTE_Y_BOTAO_SALVAR
+
+    mover_xy(x_salvar, y_salvar, "posicionar no botao Salvar")
+    clicar_xy(x_salvar, y_salvar, "botao Salvar")
+    time.sleep(2)
+    return True
+
+
+def voltar_para_pesquisa() -> None:
+    log_info("Voltando para a tela de pesquisa")
+    pressionar("esc", "voltar para a tela de pesquisa")
+    time.sleep(1.5)
+
+    clicar_campo_numero_processo()
+    time.sleep(0.8)
+
+
+def processar_lista_itens(itens: list[dict]) -> list[str]:
+    total = len(itens)
+    pjs_concluidos: list[str] = []
+
+    for indice, item in enumerate(itens, start=1):
+        pj = str(item["pj"]).strip()
+        placa = str(item["placa"]).strip()
+        sigla = str(item["sigla"]).strip()
+        observacao = montar_observacao_evento(item)
+
+        log_info(
+            f"Processando item {indice} de {total} | pj={pj} | placa={placa} | sigla={sigla}"
+        )
+
+        try:
+            abriu = pesquisar_processo(pj)
+            if not abriu:
+                log_erro(f"Nao foi possivel abrir o processo {pj}.")
+                continue
+
+            tratar_popup_cadastro_lembretes()
+            tratar_popup_lembretes()
+
+            if not abrir_novo_evento():
+                log_erro(f"Falha ao abrir novo evento | pj={pj}")
+                voltar_para_pesquisa()
+                continue
+
+            if not preencher_sigla_evento(sigla):
+                log_erro(f"Falha ao preencher sigla | pj={pj} | sigla={sigla}")
+                voltar_para_pesquisa()
+                continue
+
+            if not preencher_observacao_evento(observacao):
+                log_erro(f"Falha ao preencher observacao | pj={pj}")
+                voltar_para_pesquisa()
+                continue
+
+            if not clicar_botao_salvar():
+                log_erro(f"Falha ao salvar evento | pj={pj}")
+                voltar_para_pesquisa()
+                continue
+
+            voltar_para_pesquisa()
+            pjs_concluidos.append(pj)
+
+            total_concluidos = len(pjs_concluidos)
+            total_pjs_unicos = len(set(pjs_concluidos))
+
+            log_info(
+                f"Lancamento concluido para o processo {pj} | "
+                f"sucessos={total_concluidos} | pjs_unicos={total_pjs_unicos}"
+            )
+
+        except pyautogui.FailSafeException:
+            log_erro(
+                f"PyAutoGUI fail-safe acionado | pj={pj} | "
+                f"sucessos_ate_agora={len(pjs_concluidos)} | "
+                f"pjs_unicos_ate_agora={len(set(pjs_concluidos))}"
+            )
+            screenshot_debug("failsafe_processar_item")
+            raise
+
+        except Exception as e:
+            log_erro(
+                f"Erro ao processar item | pj={pj} | placa={placa} | sigla={sigla} | erro={e}"
+            )
+            screenshot_debug("erro_processar_item")
+
+            try:
+                voltar_para_pesquisa()
+            except Exception as erro_volta:
+                log_erro(f"Falha ao tentar voltar para pesquisa apos erro | pj={pj} | erro={erro_volta}")
+
+            continue
+
+    return pjs_concluidos
+
+
+# =========================
+# MAIN
+# =========================
+
+def main():
+    pjs_concluidos: list[str] = []
+
+    try:
+        log_info(f"VERSAO_SCRIPT: {VERSAO_SCRIPT}")
+        log_info(f"Inicio: {LOG_FILE}")
+        log_info(f"DATA_INICIO_PROCESSAMENTO: {DATA_INICIO_PROCESSAMENTO}")
+
+        validar_credenciais()
+        validar_arquivos()
+
+        df_excel = carregar_excel(ARQUIVO_EXCEL)
+        df_excel = remover_avistamentos_duplicados(df_excel)
+
+        df_query = carregar_dados_banco()
+        itens = montar_itens(df_excel, df_query)
+        log_info(f"Total de itens candidatos antes da remocao de duplicados: {len(itens)}")
+
+        itens = remover_itens_duplicados(itens)
+        log_info(f"Total de itens candidatos antes da validacao de ja lancados: {len(itens)}")
+
+        df_eventos_lancados = carregar_eventos_lancados()
+        itens = remover_itens_ja_lancados(itens, df_eventos_lancados)
+
+        if not itens:
+            log_info("Nenhum item restante para lancar apos a validacao.")
+            return
+
+        validar_itens(itens)
+
+        log_info(f"Total de itens prontos para automacao: {len(itens)}")
+
+        abrir_cpj()
+        fazer_login()
+
+        tratar_popup_cadastro_lembretes()
+
+        if aguardar_popup(IMG_NOTIFICACAO_TITULO, "notificacao", CONFIDENCE_TITULO, timeout=8):
+            fechar_notificacao_por_ancora()
+
+        if aguardar_popup(IMG_POPUP_CONFIRMA_TITULO, "confirma", CONFIDENCE_CONFIRMA, timeout=8):
+            tratar_popup_confirma()
+
+        if not clicar_icone_pastinha():
+            log_erro("Nao conseguiu clicar no icone da pastinha")
+            return
+
+        pjs_concluidos = processar_lista_itens(itens)
+
+        total_concluidos = len(pjs_concluidos)
+        total_pjs_unicos_concluidos = len(set(pjs_concluidos))
+        contador_pj = Counter(pjs_concluidos)
+
+        top_repetidos = ", ".join(
+            f"{pj} ({qtd})"
+            for pj, qtd in contador_pj.most_common(20)
+        )
+
+        log_info(f"Total de lancamentos concluidos com sucesso: {total_concluidos}")
+        log_info(f"Total de PJs unicos concluidos com sucesso: {total_pjs_unicos_concluidos}")
+
+        if top_repetidos:
+            log_info(f"PJs concluidos mais frequentes (top 20): {top_repetidos}")
+
+        log_info("Fim")
+
+    except Exception as e:
+        total_concluidos = len(pjs_concluidos)
+        total_pjs_unicos_concluidos = len(set(pjs_concluidos))
+
+        screenshot_debug("erro_automacao")
+        log_erro(
+            f"Erro nao tratado: {e} | "
+            f"sucessos_ate_erro={total_concluidos} | "
+            f"pjs_unicos_ate_erro={total_pjs_unicos_concluidos}"
+        )
+        raise
+
+
+if __name__ == "__main__":
+    main()
